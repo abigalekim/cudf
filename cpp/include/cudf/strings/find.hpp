@@ -171,6 +171,28 @@ std::unique_ptr<column> contains(
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
+/*
+ contains heterogeneous, warp, thread declarations
+*/
+
+std::unique_ptr<column> contains_thread(
+  strings_column_view const& input,
+  string_scalar const& target,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+std::unique_ptr<column> contains_warp(
+  strings_column_view const& input,
+  string_scalar const& target,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+std::unique_ptr<column> contains_heterogeneous(
+  strings_column_view const& input,
+  string_scalar const& target,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
 /**
  * @brief Returns a column of boolean values for each string where true indicates
  * the corresponding target string was found within that string in the provided column.
