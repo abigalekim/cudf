@@ -653,6 +653,12 @@ std::unique_ptr<column> contains_heterogeneous(strings_column_view const& input,
   auto strings_column = column_device_view::create(input.parent(), stream);
   auto d_strings      = *strings_column;
 
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start);
+
   // Partition indices based on string length threshold (64 bytes)
   size_type const length_threshold = 64;
   rmm::device_uvector<size_type> indices(strings_count, stream);
@@ -666,12 +672,18 @@ std::unique_ptr<column> contains_heterogeneous(strings_column_view const& input,
                         return !d_strings.is_null(idx) &&
                                d_strings.element<string_view>(idx).size_bytes() <= length_threshold;
                       });
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  float milliseconds = 0;
+  cudaEventElapsedTime(&milliseconds, start, stop);
+  printf("Partition time: %f ms\n", milliseconds);
 
   auto const short_count = thrust::distance(indices.begin(), partition_point);
   auto const long_count  = thrust::distance(partition_point, indices.end());
 
   // Thread-per-string execution
   if (short_count > 0) {
+    cudaEventRecord(start);
     auto pfn = [] __device__(string_view d_string, string_view d_target) {
       for (size_type i = 0; i <= (d_string.size_bytes() - d_target.size_bytes()); ++i) {
         if (d_target.compare(d_string.data() + i, d_target.size_bytes()) == 0) { return true; }
@@ -687,6 +699,12 @@ std::unique_ptr<column> contains_heterogeneous(strings_column_view const& input,
                         return !d_strings.is_null(idx) &&
                                bool{pfn(d_strings.element<string_view>(idx), d_target)};
                       });
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Thread time: %f ms\n", milliseconds);
   }
 
   // Warp-per-string execution
@@ -696,17 +714,151 @@ std::unique_ptr<column> contains_heterogeneous(strings_column_view const& input,
       static_cast<int64_t>(long_count) * static_cast<int64_t>(cudf::detail::warp_size);
     cudf::detail::grid_1d grid{long_count_warps, block_size};
     auto d_long_indices = indices.data() + short_count;
+    cudaEventRecord(start);
     contains_warp_parallel_fn_heterogeneous<<<grid.num_blocks,
                                               grid.num_threads_per_block,
                                               0,
                                               stream.value()>>>(
       d_strings, d_target, d_results, d_long_indices, long_count);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Warp time: %f ms\n", milliseconds);
   }
 
   results->set_null_count(input.null_count());
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+
   return results;
 }
 
+CUDF_KERNEL void contains_warp_parallel_fn_heterogeneous_bad(column_device_view const d_strings,
+                                                         string_view const d_target,
+                                                         bool* d_results)
+{
+  auto const idx = cudf::detail::grid_1d::global_thread_id();
+
+  auto const str_idx = idx / cudf::detail::warp_size;
+  if (str_idx >= d_strings.size()) { return; }
+
+  namespace cg        = cooperative_groups;
+  auto const warp     = cg::tiled_partition<cudf::detail::warp_size>(cg::this_thread_block());
+  auto const lane_idx = warp.thread_rank();
+
+  if (d_strings.is_null(str_idx)) { return; }
+
+  // get the string for this warp
+  auto const d_str = d_strings.element<string_view>(str_idx);
+  if (d_str.size_bytes() <= 64) return; 
+  // each warp processes 4 starting bytes
+  auto constexpr bytes_per_warp = 4;
+  auto found                    = false;
+  for (auto i = lane_idx * bytes_per_warp;
+       !found && ((i + d_target.size_bytes()) <= d_str.size_bytes());
+       i += cudf::detail::warp_size * bytes_per_warp) {
+    // check the target matches this part of the d_str data
+    // this is definitely faster for very long strings > 128B
+    for (auto j = 0; !found && (j < bytes_per_warp); j++) {
+      if (((i + j + d_target.size_bytes()) <= d_str.size_bytes()) &&
+          d_target.compare(d_str.data() + i + j, d_target.size_bytes()) == 0) {
+        found = true;
+      }
+    }
+  }
+
+  auto const result = warp.any(found);
+  if (lane_idx == 0) { d_results[str_idx] = result; }
+}
+
+std::unique_ptr<column> contains_heterogeneous_bad(strings_column_view const& input,
+                                                    string_scalar const& target,
+                                                    rmm::cuda_stream_view stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+  auto strings_count = input.size();
+  if (strings_count == 0) return make_empty_column(type_id::BOOL8);
+
+  CUDF_EXPECTS(target.is_valid(stream), "Parameter target must be valid.");
+
+  auto d_target = string_view(target.data(), target.size());
+
+  // create output column
+  auto results      = make_numeric_column(data_type{type_id::BOOL8},
+                                     strings_count,
+                                     cudf::detail::copy_bitmask(input.parent(), stream, mr),
+                                     input.null_count(),
+                                     stream,
+                                     mr);
+  auto results_view = results->mutable_view();
+  auto d_results    = results_view.data<bool>();
+
+  // Handle empty target
+  if (d_target.empty()) {
+    thrust::fill(
+      rmm::exec_policy_nosync(stream), results_view.begin<bool>(), results_view.end<bool>(), true);
+    results->set_null_count(input.null_count());
+    return results;
+  }
+
+  auto strings_column = column_device_view::create(input.parent(), stream);
+  auto d_strings      = *strings_column;
+
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start);
+  auto pfn = [] __device__(string_view d_string, string_view d_target) {
+    for (size_type i = 0; i <= (d_string.size_bytes() - d_target.size_bytes()); ++i) {
+      if (d_target.compare(d_string.data() + i, d_target.size_bytes()) == 0) { return true; }
+    }
+    return false;
+  };
+
+  thrust::transform(rmm::exec_policy_nosync(stream),
+                    thrust::make_counting_iterator<size_type>(0),
+                    thrust::make_counting_iterator<size_type>(strings_count),
+                    d_results,
+                    [d_strings, pfn, d_target] __device__(size_type idx) {
+                      if (d_strings.is_null(idx) || 
+                          d_strings.element<string_view>(idx).size_bytes() > 64) {
+                        return false;
+                      }
+                      return bool{pfn(d_strings.element<string_view>(idx), d_target)};
+                    });
+
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  float milliseconds = 0; 
+  cudaEventElapsedTime(&milliseconds, start, stop);
+  printf("Thread time: %f ms\n", milliseconds);
+
+  int const block_size = 256;
+  int64_t const long_count_warps =
+    static_cast<int64_t>(strings_count) * static_cast<int64_t>(cudf::detail::warp_size);
+  cudf::detail::grid_1d grid{long_count_warps, block_size};
+  
+  cudaEventRecord(start);
+  contains_warp_parallel_fn_heterogeneous_bad<<<grid.num_blocks,
+                                                 grid.num_threads_per_block,
+                                                 0,
+                                                 stream.value()>>>(d_strings, d_target, d_results);
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  milliseconds = 0; 
+  cudaEventElapsedTime(&milliseconds, start, stop);
+  printf("Warp time: %f ms\n", milliseconds);
+
+  results->set_null_count(input.null_count());
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+
+  return results;
+}
 
 std::unique_ptr<column> contains(strings_column_view const& strings,
                                  strings_column_view const& targets,
@@ -805,6 +957,15 @@ std::unique_ptr<column> contains_heterogeneous(strings_column_view const& string
 {
   CUDF_FUNC_RANGE();
   return detail::contains_heterogeneous(strings, target, stream, mr);
+}
+
+std::unique_ptr<column> contains_heterogeneous_bad(strings_column_view const& strings,
+                                 string_scalar const& target,
+                                 rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  return detail::contains_heterogeneous_bad(strings, target, stream, mr);
 }
 
 std::unique_ptr<column> contains(strings_column_view const& strings,
