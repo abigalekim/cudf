@@ -596,6 +596,20 @@ void validate_variant_child(column_view const& child)
                std::invalid_argument);
 }
 
+struct validate_variant_type_fn {
+  template <typename T>
+  void operator()()
+    requires(is_variant_castable<T>)
+  {
+  }
+  template <typename T>
+  void operator()()
+    requires(not is_variant_castable<T>)
+  {
+    CUDF_FAIL("unsupported type for variant cast", std::invalid_argument);
+  }
+};
+
 struct cast_variant_fn {
   cudf::lists_column_device_view values;
   size_type num_rows;
@@ -784,6 +798,7 @@ std::unique_ptr<column> cast_variant(column_view const& values,
                                      rmm::device_async_resource_ref mr)
 {
   validate_variant_child(values);
+  cudf::type_dispatcher(desired_type, validate_variant_type_fn{});
   size_type const num_rows = values.size();
   if (num_rows == 0) { return make_empty_column(desired_type); }
 

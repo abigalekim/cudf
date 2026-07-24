@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -714,5 +714,37 @@ TEST_F(CastVariantTest, EmptyInput)
     EXPECT_EQ(got->type().id(), id);
     EXPECT_EQ(got->size(), 0);
     EXPECT_EQ(got->null_count(), 0);
+  }
+}
+
+TEST_F(CastVariantTest, UnsupportedTypeThrows)
+{
+  // Unsupported target types must throw regardless of whether the input is empty or non-empty.
+  auto const stream = cudf::test::get_default_stream();
+
+  // Empty input: the early-return path must still validate the type.
+  auto const empty_values =
+    cudf::empty_like(cudf::structs_column_view{make_xyz_three_row_variant()}.child(1));
+  for (auto const id : {cudf::type_id::FLOAT32,
+                        cudf::type_id::FLOAT64,
+                        cudf::type_id::BOOL8,
+                        cudf::type_id::UINT32}) {
+    EXPECT_THROW(static_cast<void>(cudf::io::parquet::experimental::cast_variant(
+                   *empty_values, cudf::data_type{id}, stream)),
+                 std::invalid_argument)
+      << "expected throw for type_id " << static_cast<int>(id) << " on empty input";
+  }
+
+  // Non-empty input: the dispatch path must also throw for unsupported types.
+  auto col         = make_apache_variant(avf::primitive_int32);
+  auto const value = cudf::structs_column_view{col}.get_sliced_child(1, stream);
+  for (auto const id : {cudf::type_id::FLOAT32,
+                        cudf::type_id::FLOAT64,
+                        cudf::type_id::BOOL8,
+                        cudf::type_id::UINT32}) {
+    EXPECT_THROW(static_cast<void>(cudf::io::parquet::experimental::cast_variant(
+                   value, cudf::data_type{id}, stream)),
+                 std::invalid_argument)
+      << "expected throw for type_id " << static_cast<int>(id) << " on non-empty input";
   }
 }
